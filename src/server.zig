@@ -380,8 +380,25 @@ pub const Conn = struct {
         };
     }
 
+    /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
+    const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
+
+    /// Sends our FIN, then holds the socket until the peer closes. A socket closed under a
+    /// reader that still lags is dropped by the kernel with an RST once its FIN_WAIT_2 timer
+    /// runs out (60 s on macOS), so the reader gets the whole body and then ECONNRESET, not EOF.
     pub fn close(c: *Conn) void {
         c.flush() catch {};
+        const fd = c.stream.socket.handle;
+        _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        var sink: [256]u8 = undefined;
+        while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
+            const n = std.posix.poll(&fds, 500) catch break;
+            if (n == 0) continue;
+            // EOF or reset ends the wait; a byte from a pipelining client is dropped.
+            if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
+        }
         c.stream.close(c.io);
     }
 
@@ -18953,6 +18970,47 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     const closed = conn.peerClosed();
     _ = std.c.close(server_fd);
     try testing.expect(closed);
+}
+
+test "Conn.close keeps the socket until the peer hangs up, after the end of the body" {
+    var sv: [2]std.posix.fd_t = undefined;
+    const AF_UNIX: c_uint = 1;
+    const SOCK_STREAM: c_uint = 1;
+    try testing.expect(std.c.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    try conn.writeAll("data: [DONE]\n\n");
+
+    var closed = std.atomic.Value(bool).init(false);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, done: *std.atomic.Value(bool)) void {
+            c.close();
+            done.store(true, .release);
+        }
+    }.run, .{ &conn, &closed });
+    var client_open = true;
+    defer closer.join();
+    defer if (client_open) {
+        _ = std.c.close(sv[1]);
+    };
+
+    // The reader gets the whole body and then EOF ...
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(isize, 14), std.c.recv(sv[1], &buf, buf.len, 0));
+    try testing.expectEqual(@as(isize, 0), std.c.recv(sv[1], &buf, buf.len, 0));
+
+    // ... while the server still holds its end, so the kernel cannot reset a lagging reader.
+    std.Io.sleep(testing.io, .fromMilliseconds(100), .real) catch {};
+    try testing.expect(!closed.load(.acquire));
+
+    _ = std.c.close(sv[1]);
+    client_open = false;
+    var waited: u32 = 0;
+    while (!closed.load(.acquire) and waited < 300) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    }
+    try testing.expect(closed.load(.acquire));
 }
 
 test "listenExclusive: a second server cannot bind a port that is already listening" {
