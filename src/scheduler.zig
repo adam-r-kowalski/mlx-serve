@@ -7526,6 +7526,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // snapshot work that would just be discarded.
     const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
+    // The conversation ends where a late effort hint begins: a snapshot there lets the next
+    // request, at any effort, resume at the conversation's end.
+    var hint_start: usize = 0;
+    if (cp_stride > 0) if (slot.model.chat_config) |cc| if (slot.model.tokenizer) |tok| {
+        hint_start = chat_mod.lateEffortHintStart(slot.allocator, tok, cc.chat_template, slot.full_prompt) catch 0;
+    };
 
     // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference
     // thread is the sole mlx caller and the restore has already happened, so the entry this
@@ -7711,6 +7717,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .ssm_snapshot_at = hint_start,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
             .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)

@@ -705,7 +705,8 @@ pub fn renderChatTemplate(
         .empty_string
     else
         .null_literal;
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
+    const late_hint = lateEffortHint(tpl, enable_thinking, effort);
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, if (late_hint != null) "medium" else effort);
     defer allocator.free(extra_json);
     if (hasExtraSystemMessages(effective_messages)) {
         if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
@@ -719,7 +720,12 @@ pub fn renderChatTemplate(
 
     if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
         defer allocator.free(rendered);
-        const collapsed = try collapseDoubledThinkTags(allocator, rendered);
+        const collapsed = blk: {
+            const whole = try collapseDoubledThinkTags(allocator, rendered);
+            const hint = late_hint orelse break :blk whole;
+            defer allocator.free(whole);
+            break :blk try insertLateEffortHint(allocator, whole, hint);
+        };
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -1356,6 +1362,44 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (std.mem.eql(u8, e, "medium")) return "medium";
     if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
     return "xhigh";
+}
+
+const qwen38_27b_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+const qwen_assistant_open = "<|im_start|>assistant\n<think>\n";
+
+/// The 27B template's effort sentences as system blocks of their own.
+const late_effort_hints = [_]struct { word: []const u8, block: []const u8 }{
+    .{ .word = "low", .block = "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n" },
+    .{ .word = "xhigh", .block = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n" },
+};
+
+/// Qwen3.8's effort sentence, rendered as the last system block before the assistant turn
+/// instead of at the head of the prompt, so a conversation tokenizes (and caches) the same at
+/// every effort. Byte-pinned to the template it was measured on (Flash Next, 27B); null where
+/// the effort renders no sentence.
+fn lateEffortHint(tpl: []const u8, enable_thinking: bool, effort: ?[]const u8) ?[]const u8 {
+    if (!enable_thinking or !std.mem.eql(u8, tpl, qwen38_27b_template)) return null;
+    const word = qwen38EffortFor(effort, true);
+    for (late_effort_hints) |h| if (std.mem.eql(u8, h.word, word)) return h.block;
+    return null;
+}
+
+fn insertLateEffortHint(allocator: std.mem.Allocator, rendered: []const u8, hint: []const u8) ![]const u8 {
+    const at = if (std.mem.endsWith(u8, rendered, qwen_assistant_open)) rendered.len - qwen_assistant_open.len else rendered.len;
+    return std.mem.concat(allocator, u8, &.{ rendered[0..at], hint, rendered[at..] });
+}
+
+/// The token where a late effort hint begins in `prompt`, 0 when it has none.
+pub fn lateEffortHintStart(allocator: std.mem.Allocator, tok: *const Tokenizer, tpl: []const u8, prompt: []const u32) !usize {
+    if (!std.mem.eql(u8, tpl, qwen38_27b_template)) return 0;
+    for (late_effort_hints) |h| {
+        const text = try std.mem.concat(allocator, u8, &.{ h.block, qwen_assistant_open });
+        defer allocator.free(text);
+        const tail = try tok.encode(allocator, text);
+        defer allocator.free(tail);
+        if (tail.len > 0 and std.mem.endsWith(u32, prompt, tail)) return prompt.len - tail.len;
+    }
+    return 0;
 }
 
 /// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
@@ -10456,6 +10500,83 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
     }
 }
 
+test "late effort hint: Qwen3.8-27B renders the conversation the same at every effort, the sentence last" {
+    const a = testing.allocator;
+    const config = ChatConfig{ .chat_template = qwen38_27b_template, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "It is noon.", .reasoning_content = "Read the clock." },
+        .{ .role = "user", .content = "And in Tokyo?" },
+    };
+    const cases = [_]struct { effort: ?[]const u8, block: []const u8 }{
+        .{ .effort = null, .block = late_effort_hints[0].block },
+        .{ .effort = "low", .block = late_effort_hints[0].block },
+        .{ .effort = "high", .block = late_effort_hints[1].block },
+        .{ .effort = "xhigh", .block = late_effort_hints[1].block },
+        .{ .effort = "medium", .block = "" },
+    };
+    for ([_]?[]const u8{ null, tools_json }) |tools| {
+        const medium = try renderChatTemplate(a, &messages, &config, tools, null, true, "medium", false);
+        defer a.free(medium);
+        const conversation = medium[0 .. medium.len - qwen_assistant_open.len];
+        for (cases) |c| {
+            const rendered = try renderChatTemplate(a, &messages, &config, tools, null, true, c.effort, false);
+            defer a.free(rendered);
+            try testing.expect(std.mem.startsWith(u8, rendered, conversation));
+            try testing.expectEqualStrings(c.block, rendered[conversation.len .. rendered.len - qwen_assistant_open.len]);
+            try testing.expect(std.mem.endsWith(u8, rendered, qwen_assistant_open));
+        }
+        // The previous turn's prompt, its hint dropped, leads the next turn's at another effort.
+        const first = try renderChatTemplate(a, messages[0..2], &config, tools, null, true, "low", false);
+        defer a.free(first);
+        const next = try renderChatTemplate(a, &messages, &config, tools, null, true, "high", false);
+        defer a.free(next);
+        try testing.expect(std.mem.startsWith(u8, next, first[0 .. first.len - late_effort_hints[0].block.len - qwen_assistant_open.len]));
+    }
+    // Each block is the template's own: what it renders at the head of a conversation with no
+    // system message.
+    for (late_effort_hints) |h| {
+        const extra = try serializeExtraContext(a, &config, true, h.word);
+        defer a.free(extra);
+        const head = (try renderJinja(a, messages[1..2], &config, null, extra, .null_literal)).?;
+        defer a.free(head);
+        try testing.expect(std.mem.startsWith(u8, head, h.block));
+    }
+    // Thinking off and other templates keep the template's own placement.
+    try testing.expect(lateEffortHint(qwen38_27b_template, false, "low") == null);
+    try testing.expect(lateEffortHint(@embedFile("fixtures/qwen38_chat_template.jinja"), true, "low") == null);
+}
+
+test "late effort hint: real Qwen3.8 pack tokenizes the conversation identically before the hint" {
+    const dir = std.c.getenv("QWEN38_EFFORT_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try loadChatConfig(io, a, std.mem.span(dir));
+    defer config.deinit();
+    var tok = try tokenizer_mod.loadTokenizer(io, a, std.mem.span(dir));
+    defer tok.deinit();
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "It is noon.", .reasoning_content = "Read the clock." },
+        .{ .role = "user", .content = "And in Tokyo?" },
+    };
+    const medium = try formatChat(a, &tok, &messages, &config, null, null, true, "medium", false);
+    defer a.free(medium);
+    try testing.expectEqual(@as(usize, 0), try lateEffortHintStart(a, &tok, config.chat_template, medium));
+    for ([_][]const u8{ "low", "high" }) |effort| {
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, effort, false);
+        defer a.free(ids);
+        const start = try lateEffortHintStart(a, &tok, config.chat_template, ids);
+        try testing.expect(start > 0);
+        try testing.expectEqualSlices(u32, medium[0..start], ids[0..start]);
+        try testing.expectEqualSlices(u32, medium[start..], ids[ids.len - (medium.len - start) ..]);
+    }
+}
+
 test "serializeExtraContext with thinking enabled" {
     const allocator = testing.allocator;
     var config = ChatConfig{
@@ -15313,8 +15434,12 @@ test "mid-system: stock Qwen notes preserve tool rounds without rewriting histor
         defer a.free(second);
         const third = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
         defer a.free(third);
-        try testing.expectEqualStrings(first, second[0..@min(first.len, second.len)]);
-        const stable_second = second[0 .. second.len - "<|im_start|>assistant\n<think>\n".len];
+        // The 27B's late effort sentence belongs to the request, not to the conversation the
+        // next round extends.
+        const late = if (lateEffortHint(tpl, true, "low")) |h| h.len + qwen_assistant_open.len else 0;
+        const stable_first = first[0 .. first.len - late];
+        try testing.expectEqualStrings(stable_first, second[0..@min(stable_first.len, second.len)]);
+        const stable_second = second[0 .. second.len - @max(late, qwen_assistant_open.len)];
         try testing.expectEqualStrings(stable_second, third[0..@min(stable_second.len, third.len)]);
         try testing.expect(std.mem.indexOf(u8, third, "<|im_start|>system\nruntime note one<|im_end|>\n<|im_start|>assistant") != null);
         try testing.expect(std.mem.indexOf(u8, third, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two") != null);
@@ -15346,7 +15471,8 @@ test "mid-system: real Qwen pack loaded through ChatConfig preserves tool-round 
     const next = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
     defer a.free(next);
     try testing.expect(std.mem.indexOf(u8, first, "first question<|im_end|>\n<|im_start|>system\nruntime note one<|im_end|>") != null);
-    try testing.expect(std.mem.startsWith(u8, next, first));
+    const late = if (lateEffortHint(config.chat_template, true, "low")) |h| h.len + qwen_assistant_open.len else 0;
+    try testing.expect(std.mem.startsWith(u8, next, first[0 .. first.len - late]));
     try testing.expect(std.mem.indexOf(u8, next, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two<|im_end|>") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, next, "<tools>"));
 }
@@ -15393,9 +15519,10 @@ test "mid-system: stock Qwen adapter leaves unchanged turns and media native" {
     defer a.free(adapted);
     var native = config;
     native.chat_template = adapted;
-    const original = try renderChatTemplate(a, messages[0..3], &config, null, null, true, "low", false);
+    // Medium: the late effort sentence keys on the stock template's bytes, not the adapter's.
+    const original = try renderChatTemplate(a, messages[0..3], &config, null, null, true, "medium", false);
     defer a.free(original);
-    const equivalent = try renderChatTemplate(a, messages[0..3], &native, null, null, true, "low", false);
+    const equivalent = try renderChatTemplate(a, messages[0..3], &native, null, null, true, "medium", false);
     defer a.free(equivalent);
     try testing.expectEqualStrings(original, equivalent);
     const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
