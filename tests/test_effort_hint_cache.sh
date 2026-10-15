@@ -1,5 +1,6 @@
 #!/bin/bash
-# A Qwen3.8 conversation keeps its prompt cache when only the reasoning effort changes.
+# With --late-effort-hint, a Qwen3.8 conversation keeps its prompt cache when only the reasoning
+# effort changes. EFFORT_HINT_FLAG= runs the default (off) arm, which re-prefills.
 set -euo pipefail
 MODEL="${1:?Usage: test_effort_hint_cache.sh <qwen3.8 model_dir> [port]}"
 PORT="${2:-11369}"
@@ -15,7 +16,8 @@ cleanup() {
 }
 trap cleanup EXIT
 HOME="$SCRATCH" "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --ctx-size 16384 --prefix-cache-entries 8 --log-file "$SCRATCH/server.log" > "$SCRATCH/stdout.log" 2>&1 &
+    --ctx-size 16384 --prefix-cache-entries 8 ${EFFORT_HINT_FLAG---late-effort-hint} \
+    --log-file "$SCRATCH/server.log" > "$SCRATCH/stdout.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 600); do
     if curl -fsS "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then break; fi

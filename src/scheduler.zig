@@ -2830,6 +2830,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
     o.chat_template_kwargs = null;
+    chat_config.late_effort_hint = o.late_effort_hint orelse chat_mod.late_effort_hint_default;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -7530,7 +7531,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // request, at any effort, resume at the conversation's end.
     var hint_start: usize = 0;
     if (cp_stride > 0) if (slot.model.chat_config) |cc| if (slot.model.tokenizer) |tok| {
-        hint_start = chat_mod.lateEffortHintStart(slot.allocator, tok, cc.chat_template, slot.full_prompt) catch 0;
+        hint_start = chat_mod.lateEffortHintStart(slot.allocator, tok, cc, slot.full_prompt) catch 0;
     };
 
     // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference
@@ -11781,6 +11782,24 @@ test "applyModelSettings: model MTP setting outranks the launch default" {
         var o = model_settings.Override{ .mtp = c.setting };
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
+    }
+}
+
+test "applyModelSettings: the late effort hint is off unless the launch flag or the model asks" {
+    const saved = chat_mod.late_effort_hint_default;
+    defer chat_mod.late_effort_hint_default = saved;
+    var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    for ([_]struct { flag: bool, setting: ?bool, want: bool }{
+        .{ .flag = false, .setting = null, .want = false },
+        .{ .flag = false, .setting = true, .want = true },
+        .{ .flag = true, .setting = null, .want = true },
+        .{ .flag = true, .setting = false, .want = false },
+    }) |c| {
+        chat_mod.late_effort_hint_default = c.flag;
+        var cfg = ModelConfig{};
+        var o = model_settings.Override{ .late_effort_hint = c.setting };
+        applyModelSettings(&cfg, &cc, &o, true);
+        try testing.expectEqual(c.want, cc.late_effort_hint);
     }
 }
 

@@ -2692,11 +2692,12 @@ nothing from the prompt cache: a 24k-token conversation re-prefilled for about 6
 Cause: the template renders the effort sentence (xhigh, low; medium has none) at the head of the
 first system block, so the effort word changed the prompt's first tokens.
 
-Fix: on the byte-pinned 27B / Flash Next template the render passes `medium` (no sentence) and
-inserts the sentence as its own system block right before the assistant turn (`lateEffortHint`).
-The prefill ends a chunk where that block begins and snapshots there instead of 30 tokens before
-the prompt's end (`lateEffortHintStart` -> `ssm_snapshot_at`), so a hybrid resumes exactly at the
-conversation's end. Cost: a client that
+Fix, opt-in because it changes the prompt the template defines (`--late-effort-hint`, or
+`late_effort_hint` per model in `model-settings.json`): on the byte-pinned 27B / Flash Next
+template the render passes `medium` (no sentence) and inserts the sentence as its own system block
+right before the assistant turn (`lateEffortHint`). The prefill ends a chunk where that block
+begins and snapshots there instead of 30 tokens before the prompt's end (`lateEffortHintStart` ->
+`ssm_snapshot_at`), so a hybrid resumes exactly at the conversation's end. Cost: a client that
 replays the model's reasoning no longer resumes after the previous reply at low or xhigh, because
 that reply was generated after a hint the next prompt does not repeat.
 Guard: `late effort hint:` tests (chat.zig), `ssmSnapshotStop` (generate.zig),
